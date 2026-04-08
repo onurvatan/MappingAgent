@@ -1,0 +1,8 @@
+Invoice No: HC-2026-099
+Invoice Date: 08/04/2026
+Bill To
+Helios Consulting Group
+Consulting services for March
+Subtotal: GBP 3500.00
+VAT: GBP 700.00
+Total Due: GBP 4200.00

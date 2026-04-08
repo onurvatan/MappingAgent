@@ -51,17 +51,17 @@ public sealed partial class AccountingDocumentAnalysisService(AccountingDbContex
             confidence += 0.15m;
             matchResults.Add(new
             {
-                type = "counterparty",
+                matchType = "counterparty",
                 result = "matched",
-                matchedCounterparty.Id,
-                matchedCounterparty.Name,
-                matchedCounterparty.Type
+                counterpartyId = matchedCounterparty.Id,
+                counterpartyName = matchedCounterparty.Name,
+                counterpartyRecordType = matchedCounterparty.Type
             });
         }
         else
         {
             validationIssues.Add("Counterparty could not be matched to the existing database.");
-            matchResults.Add(new { type = "counterparty", result = "unmatched" });
+            matchResults.Add(new { matchType = "counterparty", result = "unmatched" });
         }
 
         if (documentKind is not DocumentKind.UnknownAccountingDocument)
@@ -104,7 +104,7 @@ public sealed partial class AccountingDocumentAnalysisService(AccountingDbContex
 
             matchResults.Add(new
             {
-                type = "duplicate",
+                matchType = "duplicate",
                 result = duplicateInvoice ? "duplicate" : "clear",
                 invoiceNumber
             });

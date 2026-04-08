@@ -1,0 +1,8 @@
+Invoice Number: AC-2026-004
+Invoice Date: 08/04/2026
+Supplier
+Acme Office Supplies Ltd
+Subtotal: GBP 240.00
+VAT: GBP 48.00
+Total: GBP 288.00
+Printer cartridges
