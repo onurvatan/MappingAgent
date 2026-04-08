@@ -1,23 +1,41 @@
 using MappingAgent.Api.Data;
+using MappingAgent.Api.Agents;
 using MappingAgent.Api.Models;
 using MappingAgent.Contracts.Enums;
 using MappingAgent.Domain.Entities;
+using Microsoft.Extensions.AI;
 using Microsoft.EntityFrameworkCore;
 using System.Globalization;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 
 namespace MappingAgent.Api.Services;
 
-public sealed partial class AccountingDocumentAnalysisService(AccountingDbContext dbContext) : IAccountingDocumentAnalysisService
+public sealed class AccountingDocumentAnalysisService(
+    AccountingDbContext dbContext,
+    AccountingMappingWorkflowAgent workflowAgent) : IAccountingDocumentAnalysisService
 {
     public async Task<AccountingAnalysisResult> AnalyzeAsync(
         SourceFile sourceFile,
         ExtractedDocument extractedDocument,
         CancellationToken cancellationToken)
     {
-        var rawText = extractedDocument.RawText ?? string.Empty;
-        var normalizedText = rawText.ToLowerInvariant();
+        var agent = workflowAgent.CreateAgent(AccountingMappingWorkflowAgent.AgentName);
+        var prompt = BuildPrompt(sourceFile, extractedDocument);
+        var result = await agent.RunAsync(
+            [new ChatMessage(ChatRole.User, prompt)],
+            null,
+            null,
+            cancellationToken);
+
+        var payload = result.Text ?? string.Empty;
+        var draft = JsonSerializer.Deserialize<AgentMappedDocumentDraft>(
+            payload,
+            new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            })
+            ?? throw new InvalidOperationException("The mapping workflow returned an empty or invalid JSON payload.");
+
         var counterparties = await dbContext.Counterparties
             .AsNoTracking()
             .ToArrayAsync(cancellationToken);
@@ -25,30 +43,37 @@ public sealed partial class AccountingDocumentAnalysisService(AccountingDbContex
         var matchedCounterparty = counterparties
             .OrderByDescending(counterparty => counterparty.Name.Length)
             .FirstOrDefault(counterparty =>
-                normalizedText.Contains(counterparty.Name, StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrWhiteSpace(draft.CounterpartyName) &&
+                 draft.CounterpartyName.Contains(counterparty.Name, StringComparison.OrdinalIgnoreCase)) ||
+                extractedDocument.RawText.Contains(counterparty.Name, StringComparison.OrdinalIgnoreCase) ||
                 (!string.IsNullOrWhiteSpace(counterparty.TaxIdentifier) &&
-                 normalizedText.Contains(counterparty.TaxIdentifier, StringComparison.OrdinalIgnoreCase)));
+                 ((draft.CounterpartyTaxIdentifier?.Contains(counterparty.TaxIdentifier, StringComparison.OrdinalIgnoreCase) ?? false) ||
+                  extractedDocument.RawText.Contains(counterparty.TaxIdentifier, StringComparison.OrdinalIgnoreCase))));
 
-        var documentKind = ClassifyDocumentKind(normalizedText, matchedCounterparty);
-        var direction = InferDirection(documentKind, normalizedText, matchedCounterparty);
-
-        var invoiceNumber = ExtractInvoiceNumber(rawText);
-        var invoiceDate = ExtractDate(rawText, "invoice date", "date");
-        var dueDate = ExtractDate(rawText, "due date", "payment due");
-        var subtotal = ExtractAmount(rawText, "subtotal", "net amount");
-        var taxAmount = ExtractAmount(rawText, "vat", "tax");
-        var totalAmount = ExtractAmount(rawText, "total due", "invoice total", "total");
-        var currency = DetectCurrency(rawText);
-        var counterpartyName = matchedCounterparty?.Name ?? ExtractCounterpartyName(rawText, direction);
-        var suggestedCategory = SuggestCategory(normalizedText, direction, matchedCounterparty);
+        var documentKind = ParseDocumentKind(draft.DocumentKind);
+        var direction = ParseDirection(draft.Direction);
+        var invoiceDate = ParseDate(draft.InvoiceDate);
+        var dueDate = ParseDate(draft.DueDate);
+        var subtotal = draft.Subtotal;
+        var taxAmount = draft.TaxAmount;
+        var totalAmount = draft.TotalAmount;
+        var currency = string.IsNullOrWhiteSpace(draft.Currency) ? "GBP" : draft.Currency!.ToUpperInvariant();
+        var counterpartyName = matchedCounterparty?.Name ?? draft.CounterpartyName;
+        var suggestedCategory = string.IsNullOrWhiteSpace(draft.SuggestedCategory)
+            ? InferFallbackCategory(direction, matchedCounterparty)
+            : draft.SuggestedCategory!;
 
         var validationIssues = new List<string>();
         var matchResults = new List<object>();
-        var confidence = 0.55m;
+        if (draft.Warnings is { Count: > 0 })
+        {
+            validationIssues.AddRange(draft.Warnings);
+        }
+
+        var confidence = decimal.Clamp(draft.Confidence ?? 0.6m, 0.05m, 0.99m);
 
         if (matchedCounterparty is not null)
         {
-            confidence += 0.15m;
             matchResults.Add(new
             {
                 matchType = "counterparty",
@@ -66,47 +91,34 @@ public sealed partial class AccountingDocumentAnalysisService(AccountingDbContex
 
         if (documentKind is not DocumentKind.UnknownAccountingDocument)
         {
-            confidence += 0.10m;
+            confidence = decimal.Min(0.99m, confidence + 0.05m);
         }
 
-        if (!string.IsNullOrWhiteSpace(invoiceNumber))
-        {
-            confidence += 0.10m;
-        }
-        else
+        if (string.IsNullOrWhiteSpace(draft.InvoiceNumber))
         {
             validationIssues.Add("Invoice number could not be extracted.");
         }
 
-        if (totalAmount.HasValue)
-        {
-            confidence += 0.10m;
-        }
-        else
+        if (!totalAmount.HasValue)
         {
             validationIssues.Add("Total amount could not be extracted.");
         }
 
-        if (invoiceDate.HasValue)
-        {
-            confidence += 0.05m;
-        }
-
         bool duplicateInvoice = false;
-        if (matchedCounterparty is not null && !string.IsNullOrWhiteSpace(invoiceNumber))
+        if (matchedCounterparty is not null && !string.IsNullOrWhiteSpace(draft.InvoiceNumber))
         {
             duplicateInvoice = await dbContext.AccountingDocuments
                 .AsNoTracking()
                 .AnyAsync(document =>
                     document.CounterpartyId == matchedCounterparty.Id &&
-                    document.InvoiceNumber == invoiceNumber,
+                    document.InvoiceNumber == draft.InvoiceNumber,
                     cancellationToken);
 
             matchResults.Add(new
             {
                 matchType = "duplicate",
                 result = duplicateInvoice ? "duplicate" : "clear",
-                invoiceNumber
+                invoiceNumber = draft.InvoiceNumber
             });
 
             if (duplicateInvoice)
@@ -129,8 +141,6 @@ public sealed partial class AccountingDocumentAnalysisService(AccountingDbContex
             validationIssues.Add("Document could not be classified as an income invoice, expense invoice, or credit note.");
         }
 
-        confidence = decimal.Clamp(confidence, 0.05m, 0.99m);
-
         var mappedPayload = new
         {
             sourceFileId = sourceFile.Id,
@@ -140,11 +150,12 @@ public sealed partial class AccountingDocumentAnalysisService(AccountingDbContex
             {
                 matchedCounterpartyId = matchedCounterparty?.Id,
                 counterpartyName,
-                counterpartyType = matchedCounterparty?.Type
+                counterpartyType = matchedCounterparty?.Type,
+                counterpartyTaxIdentifier = draft.CounterpartyTaxIdentifier
             },
             invoice = new
             {
-                invoiceNumber,
+                invoiceNumber = draft.InvoiceNumber,
                 invoiceDate,
                 dueDate,
                 currency,
@@ -190,214 +201,74 @@ public sealed partial class AccountingDocumentAnalysisService(AccountingDbContex
             requiresReview ? null : null);
     }
 
-    private static DocumentKind ClassifyDocumentKind(string normalizedText, Counterparty? matchedCounterparty)
+    private static string BuildPrompt(SourceFile sourceFile, ExtractedDocument extractedDocument)
     {
-        if (normalizedText.Contains("credit note", StringComparison.Ordinal) ||
-            normalizedText.Contains("credit memo", StringComparison.Ordinal))
-        {
-            return DocumentKind.CreditNote;
-        }
+        return $$"""
+Analyze this parsed accounting document and return structured JSON only.
 
-        if (matchedCounterparty?.Type.Equals("Vendor", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            return DocumentKind.ExpenseInvoice;
-        }
+Supported document kinds:
+- ExpenseInvoice
+- IncomeInvoice
+- CreditNote
+- UnknownAccountingDocument
 
-        if (matchedCounterparty?.Type.Equals("Customer", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            return DocumentKind.IncomeInvoice;
-        }
+Supported directions:
+- Expense
+- Income
+- Unknown
 
-        if (normalizedText.Contains("bill to", StringComparison.Ordinal) ||
-            normalizedText.Contains("customer", StringComparison.Ordinal) ||
-            normalizedText.Contains("consulting", StringComparison.Ordinal) ||
-            normalizedText.Contains("service revenue", StringComparison.Ordinal))
-        {
-            return DocumentKind.IncomeInvoice;
-        }
-
-        if (normalizedText.Contains("supplier", StringComparison.Ordinal) ||
-            normalizedText.Contains("vendor", StringComparison.Ordinal) ||
-            normalizedText.Contains("amount due", StringComparison.Ordinal) ||
-            normalizedText.Contains("purchase", StringComparison.Ordinal))
-        {
-            return DocumentKind.ExpenseInvoice;
-        }
-
-        if (normalizedText.Contains("invoice", StringComparison.Ordinal))
-        {
-            return DocumentKind.ExpenseInvoice;
-        }
-
-        return DocumentKind.UnknownAccountingDocument;
+Parsed input:
+{
+  "sourceFileName": "{{sourceFile.FileName}}",
+  "extension": "{{sourceFile.Extension}}",
+  "parserName": "{{extractedDocument.ParserName}}",
+  "parserWarningsJson": {{extractedDocument.ParserWarningsJson}},
+  "rawText": {{JsonSerializer.Serialize(extractedDocument.RawText)}}
+}
+""";
     }
 
-    private static DocumentDirection InferDirection(
-        DocumentKind documentKind,
-        string normalizedText,
-        Counterparty? matchedCounterparty)
+    private static DocumentKind ParseDocumentKind(string? value)
     {
-        if (matchedCounterparty?.Type.Equals("Vendor", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            return DocumentDirection.Expense;
-        }
-
-        if (matchedCounterparty?.Type.Equals("Customer", StringComparison.OrdinalIgnoreCase) == true)
-        {
-            return DocumentDirection.Income;
-        }
-
-        return documentKind switch
-        {
-            DocumentKind.ExpenseInvoice => DocumentDirection.Expense,
-            DocumentKind.IncomeInvoice => DocumentDirection.Income,
-            DocumentKind.CreditNote when normalizedText.Contains("refund", StringComparison.Ordinal) => DocumentDirection.Expense,
-            DocumentKind.CreditNote => DocumentDirection.Income,
-            _ => DocumentDirection.Unknown
-        };
+        return Enum.TryParse<DocumentKind>(value, ignoreCase: true, out var parsed)
+            ? parsed
+            : DocumentKind.UnknownAccountingDocument;
     }
 
-    private static string SuggestCategory(string normalizedText, DocumentDirection direction, Counterparty? matchedCounterparty)
+    private static DocumentDirection ParseDirection(string? value)
+    {
+        return Enum.TryParse<DocumentDirection>(value, ignoreCase: true, out var parsed)
+            ? parsed
+            : DocumentDirection.Unknown;
+    }
+
+    private static DateOnly? ParseDate(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        if (DateOnly.TryParse(value, CultureInfo.InvariantCulture, out var invariant))
+        {
+            return invariant;
+        }
+
+        if (DateOnly.TryParse(value, CultureInfo.GetCultureInfo("en-GB"), out var gb))
+        {
+            return gb;
+        }
+
+        return null;
+    }
+
+    private static string InferFallbackCategory(DocumentDirection direction, Counterparty? matchedCounterparty)
     {
         if (!string.IsNullOrWhiteSpace(matchedCounterparty?.DefaultCategory))
         {
             return matchedCounterparty.DefaultCategory;
         }
 
-        if (direction == DocumentDirection.Income)
-        {
-            if (normalizedText.Contains("consult", StringComparison.Ordinal))
-            {
-                return "ConsultingRevenue";
-            }
-
-            if (normalizedText.Contains("subscription", StringComparison.Ordinal))
-            {
-                return "SubscriptionRevenue";
-            }
-
-            return "ServiceRevenue";
-        }
-
-        if (normalizedText.Contains("hosting", StringComparison.Ordinal) ||
-            normalizedText.Contains("license", StringComparison.Ordinal) ||
-            normalizedText.Contains("subscription", StringComparison.Ordinal))
-        {
-            return "Software";
-        }
-
-        if (normalizedText.Contains("office", StringComparison.Ordinal) ||
-            normalizedText.Contains("printer", StringComparison.Ordinal) ||
-            normalizedText.Contains("stationery", StringComparison.Ordinal))
-        {
-            return "OfficeSupplies";
-        }
-
-        if (normalizedText.Contains("travel", StringComparison.Ordinal) ||
-            normalizedText.Contains("hotel", StringComparison.Ordinal) ||
-            normalizedText.Contains("flight", StringComparison.Ordinal))
-        {
-            return "Travel";
-        }
-
         return direction == DocumentDirection.Income ? "OtherIncome" : "OtherExpense";
     }
-
-    private static string? ExtractInvoiceNumber(string rawText)
-    {
-        var match = InvoiceNumberRegex().Match(rawText);
-        return match.Success ? match.Groups[2].Value.Trim() : null;
-    }
-
-    private static DateOnly? ExtractDate(string rawText, params string[] labels)
-    {
-        foreach (var label in labels)
-        {
-            var regex = new Regex($@"{Regex.Escape(label)}\s*[:#-]?\s*([A-Za-z0-9/\- ]+)", RegexOptions.IgnoreCase);
-            var match = regex.Match(rawText);
-            if (!match.Success)
-            {
-                continue;
-            }
-
-            var candidate = match.Groups[1].Value.Trim();
-            if (DateOnly.TryParse(candidate, CultureInfo.GetCultureInfo("en-GB"), out var parsedGb))
-            {
-                return parsedGb;
-            }
-
-            if (DateOnly.TryParse(candidate, CultureInfo.GetCultureInfo("en-US"), out var parsedUs))
-            {
-                return parsedUs;
-            }
-        }
-
-        return null;
-    }
-
-    private static decimal? ExtractAmount(string rawText, params string[] labels)
-    {
-        foreach (var label in labels)
-        {
-            var regex = new Regex($@"{Regex.Escape(label)}\s*[:#-]?\s*(GBP|USD|EUR|£|\$|€)?\s*([0-9,]+(?:\.[0-9]{{2}})?)", RegexOptions.IgnoreCase);
-            var match = regex.Match(rawText);
-            if (match.Success &&
-                decimal.TryParse(match.Groups[2].Value, NumberStyles.AllowDecimalPoint | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out var amount))
-            {
-                return amount;
-            }
-        }
-
-        return null;
-    }
-
-    private static string DetectCurrency(string rawText)
-    {
-        if (rawText.Contains("GBP", StringComparison.OrdinalIgnoreCase) || rawText.Contains('£'))
-        {
-            return "GBP";
-        }
-
-        if (rawText.Contains("EUR", StringComparison.OrdinalIgnoreCase) || rawText.Contains('€'))
-        {
-            return "EUR";
-        }
-
-        if (rawText.Contains("USD", StringComparison.OrdinalIgnoreCase) || rawText.Contains('$'))
-        {
-            return "USD";
-        }
-
-        return "GBP";
-    }
-
-    private static string? ExtractCounterpartyName(string rawText, DocumentDirection direction)
-    {
-        var lines = rawText.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-        var anchorPatterns = direction == DocumentDirection.Income
-            ? new[] { "bill to", "customer", "client" }
-            : new[] { "supplier", "vendor", "from" };
-
-        for (var index = 0; index < lines.Length; index++)
-        {
-            if (!anchorPatterns.Any(pattern => lines[index].Contains(pattern, StringComparison.OrdinalIgnoreCase)))
-            {
-                continue;
-            }
-
-            if (index + 1 < lines.Length && !string.IsNullOrWhiteSpace(lines[index + 1]))
-            {
-                return lines[index + 1];
-            }
-        }
-
-        return lines.FirstOrDefault(line =>
-            !line.Contains("invoice", StringComparison.OrdinalIgnoreCase) &&
-            !line.Contains("total", StringComparison.OrdinalIgnoreCase) &&
-            !line.Contains("date", StringComparison.OrdinalIgnoreCase));
-    }
-
-    [GeneratedRegex(@"(invoice(?:\s*(number|no|#))?|inv(?:oice)?\s*#?)\s*[:#-]?\s*([A-Z0-9\-/]+)", RegexOptions.IgnoreCase)]
-    private static partial Regex InvoiceNumberRegex();
 }
