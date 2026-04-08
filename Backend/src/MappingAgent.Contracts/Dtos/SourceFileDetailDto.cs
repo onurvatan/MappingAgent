@@ -13,4 +13,5 @@ public sealed record SourceFileDetailDto(
     FileProcessingStatus Status,
     string? FailureReason,
     string? FailureMessage,
+    ExtractedDocumentDto? ExtractedDocument,
     MappedDocumentDto? MappedDocument);

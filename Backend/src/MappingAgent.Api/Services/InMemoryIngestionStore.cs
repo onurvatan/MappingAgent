@@ -7,7 +7,9 @@ public sealed class InMemoryIngestionStore : IIngestionStore
 {
     private readonly List<IngestionJob> _jobs;
     private readonly List<SourceFile> _files;
+    private readonly List<ExtractedDocument> _extractedDocuments;
     private readonly List<MappedAccountingDocument> _mappedDocuments;
+    private readonly Lock _gate = new();
 
     public InMemoryIngestionStore()
     {
@@ -131,18 +133,214 @@ public sealed class InMemoryIngestionStore : IIngestionStore
                 """
             }
         ];
+
+        _extractedDocuments =
+        [
+            new ExtractedDocument
+            {
+                Id = Guid.Parse("f48706a6-0a2c-4ef9-b2f4-a173d26d2e85"),
+                SourceFileId = completedFileId,
+                ParserName = "PdfFileParser",
+                RawText = "Invoice AC-2026-005\nAcme Office Supplies Ltd\nTotal GBP 156.00",
+                TablesJson = """[{"pageNumber":1,"text":"Invoice AC-2026-005"}]""",
+                ParserWarningsJson = "[]"
+            }
+        ];
     }
 
-    public Task<IReadOnlyList<IngestionJob>> GetJobsAsync(CancellationToken cancellationToken) =>
-        Task.FromResult<IReadOnlyList<IngestionJob>>(_jobs);
+    public Task<IReadOnlyList<IngestionJob>> GetJobsAsync(CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult<IReadOnlyList<IngestionJob>>(_jobs
+                .Select(CloneJob)
+                .ToArray());
+        }
+    }
 
-    public Task<IReadOnlyList<SourceFile>> GetFilesByJobIdAsync(Guid ingestionJobId, CancellationToken cancellationToken) =>
-        Task.FromResult<IReadOnlyList<SourceFile>>(
-            _files.Where(file => file.IngestionJobId == ingestionJobId).ToArray());
+    public Task<IngestionJob?> GetJobAsync(Guid ingestionJobId, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult(_jobs
+                .Where(job => job.Id == ingestionJobId)
+                .Select(CloneJob)
+                .SingleOrDefault());
+        }
+    }
 
-    public Task<SourceFile?> GetSourceFileAsync(Guid sourceFileId, CancellationToken cancellationToken) =>
-        Task.FromResult(_files.SingleOrDefault(file => file.Id == sourceFileId));
+    public Task<IngestionJob> CreateJobAsync(IngestionJob ingestionJob, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            var clone = CloneJob(ingestionJob);
+            _jobs.Add(clone);
+            return Task.FromResult(CloneJob(clone));
+        }
+    }
 
-    public Task<MappedAccountingDocument?> GetMappedDocumentBySourceFileIdAsync(Guid sourceFileId, CancellationToken cancellationToken) =>
-        Task.FromResult(_mappedDocuments.SingleOrDefault(document => document.SourceFileId == sourceFileId));
+    public Task UpdateJobAsync(IngestionJob ingestionJob, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            var existing = _jobs.Single(job => job.Id == ingestionJob.Id);
+            existing.FolderPath = ingestionJob.FolderPath;
+            existing.Status = ingestionJob.Status;
+            existing.StartedAtUtc = ingestionJob.StartedAtUtc;
+            existing.CompletedAtUtc = ingestionJob.CompletedAtUtc;
+            existing.TotalFileCount = ingestionJob.TotalFileCount;
+            existing.CompletedFileCount = ingestionJob.CompletedFileCount;
+            existing.FailedFileCount = ingestionJob.FailedFileCount;
+            existing.NeedsReviewFileCount = ingestionJob.NeedsReviewFileCount;
+            return Task.CompletedTask;
+        }
+    }
+
+    public Task ReplaceFilesAsync(Guid ingestionJobId, IReadOnlyList<SourceFile> files, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            _files.RemoveAll(file => file.IngestionJobId == ingestionJobId);
+            _files.AddRange(files.Select(CloneFile));
+            return Task.CompletedTask;
+        }
+    }
+
+    public Task<IReadOnlyList<SourceFile>> GetFilesByJobIdAsync(Guid ingestionJobId, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult<IReadOnlyList<SourceFile>>(
+                _files.Where(file => file.IngestionJobId == ingestionJobId)
+                    .Select(CloneFile)
+                    .ToArray());
+        }
+    }
+
+    public Task<SourceFile?> GetSourceFileAsync(Guid sourceFileId, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult(_files
+                .Where(file => file.Id == sourceFileId)
+                .Select(CloneFile)
+                .SingleOrDefault());
+        }
+    }
+
+    public Task UpdateSourceFileAsync(SourceFile sourceFile, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            var existing = _files.Single(file => file.Id == sourceFile.Id);
+            existing.AbsolutePath = sourceFile.AbsolutePath;
+            existing.FileName = sourceFile.FileName;
+            existing.Extension = sourceFile.Extension;
+            existing.SizeBytes = sourceFile.SizeBytes;
+            existing.LastModifiedUtc = sourceFile.LastModifiedUtc;
+            existing.ContentHash = sourceFile.ContentHash;
+            existing.Status = sourceFile.Status;
+            existing.FailureReason = sourceFile.FailureReason;
+            existing.FailureMessage = sourceFile.FailureMessage;
+            return Task.CompletedTask;
+        }
+    }
+
+    public Task<ExtractedDocument?> GetExtractedDocumentBySourceFileIdAsync(Guid sourceFileId, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult(_extractedDocuments
+                .Where(document => document.SourceFileId == sourceFileId)
+                .Select(CloneExtractedDocument)
+                .SingleOrDefault());
+        }
+    }
+
+    public Task SaveExtractedDocumentAsync(ExtractedDocument extractedDocument, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            _extractedDocuments.RemoveAll(document => document.SourceFileId == extractedDocument.SourceFileId);
+            _extractedDocuments.Add(CloneExtractedDocument(extractedDocument));
+            return Task.CompletedTask;
+        }
+    }
+
+    public Task<MappedAccountingDocument?> GetMappedDocumentBySourceFileIdAsync(Guid sourceFileId, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            return Task.FromResult(_mappedDocuments
+                .Where(document => document.SourceFileId == sourceFileId)
+                .Select(CloneMappedDocument)
+                .SingleOrDefault());
+        }
+    }
+
+    public Task SaveMappedDocumentAsync(MappedAccountingDocument mappedAccountingDocument, CancellationToken cancellationToken)
+    {
+        lock (_gate)
+        {
+            _mappedDocuments.RemoveAll(document => document.SourceFileId == mappedAccountingDocument.SourceFileId);
+            _mappedDocuments.Add(CloneMappedDocument(mappedAccountingDocument));
+            return Task.CompletedTask;
+        }
+    }
+
+    private static IngestionJob CloneJob(IngestionJob job) =>
+        new()
+        {
+            Id = job.Id,
+            FolderPath = job.FolderPath,
+            Status = job.Status,
+            StartedAtUtc = job.StartedAtUtc,
+            CompletedAtUtc = job.CompletedAtUtc,
+            TotalFileCount = job.TotalFileCount,
+            CompletedFileCount = job.CompletedFileCount,
+            FailedFileCount = job.FailedFileCount,
+            NeedsReviewFileCount = job.NeedsReviewFileCount
+        };
+
+    private static SourceFile CloneFile(SourceFile file) =>
+        new()
+        {
+            Id = file.Id,
+            IngestionJobId = file.IngestionJobId,
+            AbsolutePath = file.AbsolutePath,
+            FileName = file.FileName,
+            Extension = file.Extension,
+            SizeBytes = file.SizeBytes,
+            LastModifiedUtc = file.LastModifiedUtc,
+            ContentHash = file.ContentHash,
+            Status = file.Status,
+            FailureReason = file.FailureReason,
+            FailureMessage = file.FailureMessage
+        };
+
+    private static ExtractedDocument CloneExtractedDocument(ExtractedDocument document) =>
+        new()
+        {
+            Id = document.Id,
+            SourceFileId = document.SourceFileId,
+            RawText = document.RawText,
+            TablesJson = document.TablesJson,
+            ParserName = document.ParserName,
+            ParserWarningsJson = document.ParserWarningsJson
+        };
+
+    private static MappedAccountingDocument CloneMappedDocument(MappedAccountingDocument document) =>
+        new()
+        {
+            Id = document.Id,
+            SourceFileId = document.SourceFileId,
+            DocumentKind = document.DocumentKind,
+            Direction = document.Direction,
+            SuggestedCategory = document.SuggestedCategory,
+            ConfidenceScore = document.ConfidenceScore,
+            MappedDataJson = document.MappedDataJson,
+            ValidationIssuesJson = document.ValidationIssuesJson,
+            MatchResultsJson = document.MatchResultsJson,
+            ReviewStatus = document.ReviewStatus
+        };
 }
