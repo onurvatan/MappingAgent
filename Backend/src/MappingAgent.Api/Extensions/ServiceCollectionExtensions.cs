@@ -1,11 +1,13 @@
 using Azure.AI.OpenAI;
 using MappingAgent.Api.Agents;
-using MappingAgent.Api.Data;
 using MappingAgent.Api.Configuration;
+using MappingAgent.Api.Data;
 using MappingAgent.Api.Options;
 using MappingAgent.Api.Services;
+using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
 using System.ClientModel;
 
@@ -48,29 +50,44 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IIngestionStore, InMemoryIngestionStore>();
         services.AddSingleton<IHashingService, HashingService>();
         services.AddSingleton<IFileParsingService, FileParsingService>();
-        services.AddSingleton(sp =>
-        {
-            var settings = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<FoundrySettings>>().Value;
-            if (string.IsNullOrWhiteSpace(settings.Endpoint))
-            {
-                throw new InvalidOperationException("Foundry:Endpoint is required for agent-based document mapping.");
-            }
-
-            if (!string.IsNullOrWhiteSpace(settings.ApiKey))
-            {
-                return new AzureOpenAIClient(new Uri(settings.Endpoint), new ApiKeyCredential(settings.ApiKey));
-            }
-
-            return new AzureOpenAIClient(new Uri(settings.Endpoint), new Azure.Identity.DefaultAzureCredential());
-        });
-        services.AddSingleton<IChatClient>(sp =>
-        {
-            var settings = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<FoundrySettings>>().Value;
-            return sp.GetRequiredService<AzureOpenAIClient>()
-                .GetChatClient(settings.Deployment)
-                .AsIChatClient();
-        });
         services.AddSingleton<AccountingMappingWorkflowAgent>();
+
+        var foundrySettings = configuration
+            .GetSection(FoundrySettings.SectionName)
+            .Get<FoundrySettings>();
+
+        if (foundrySettings?.IsConfigured == true)
+        {
+            services.AddSingleton(sp =>
+            {
+                var settings = sp.GetRequiredService<IOptions<FoundrySettings>>().Value;
+                if (!string.IsNullOrWhiteSpace(settings.ApiKey))
+                {
+                    return new AzureOpenAIClient(new Uri(settings.Endpoint), new ApiKeyCredential(settings.ApiKey));
+                }
+
+                return new AzureOpenAIClient(new Uri(settings.Endpoint), new Azure.Identity.DefaultAzureCredential());
+            });
+
+            services.AddSingleton<IChatClient>(sp =>
+            {
+                var settings = sp.GetRequiredService<IOptions<FoundrySettings>>().Value;
+                return sp.GetRequiredService<AzureOpenAIClient>()
+                    .GetChatClient(settings.Deployment)
+                    .AsIChatClient();
+            });
+
+            services.AddKeyedSingleton<AIAgent>(AccountingMappingWorkflowAgent.AgentName, (sp, key) =>
+                sp.GetRequiredService<AccountingMappingWorkflowAgent>()
+                    .CreateAgent(key?.ToString() ?? AccountingMappingWorkflowAgent.AgentName));
+
+            services.AddScoped<IAccountingMappingAgentRunner, AccountingMappingAgentRunner>();
+        }
+        else
+        {
+            services.AddScoped<IAccountingMappingAgentRunner, UnavailableAccountingMappingAgentRunner>();
+        }
+
         services.AddScoped<IAccountingDocumentAnalysisService, AccountingDocumentAnalysisService>();
         services.AddSingleton<IFileParser, PdfFileParser>();
         services.AddSingleton<IFileParser, ExcelFileParser>();

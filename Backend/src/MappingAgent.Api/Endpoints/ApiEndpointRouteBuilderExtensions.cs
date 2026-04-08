@@ -1,4 +1,5 @@
 using MappingAgent.Api.Data;
+using MappingAgent.Api.Models;
 using MappingAgent.Api.Services;
 using MappingAgent.Contracts.Dtos;
 using MappingAgent.Contracts.Enums;
@@ -239,7 +240,20 @@ public static class ApiEndpointRouteBuilderExtensions
             file.Status = FileProcessingStatus.Matching;
             await ingestionStore.UpdateSourceFileAsync(file, cancellationToken);
 
-            var analysisResult = await analysisService.AnalyzeAsync(file, extractedDocument, cancellationToken);
+            AccountingAnalysisResult analysisResult;
+            try
+            {
+                analysisResult = await analysisService.AnalyzeAsync(file, extractedDocument, cancellationToken);
+            }
+            catch (InvalidOperationException ex)
+            {
+                file.Status = FileProcessingStatus.Failed;
+                file.FailureReason = "AgentNotConfigured";
+                file.FailureMessage = ex.Message;
+                job.FailedFileCount++;
+                await ingestionStore.UpdateSourceFileAsync(file, cancellationToken);
+                continue;
+            }
 
             await ingestionStore.SaveMappedDocumentAsync(new MappedAccountingDocument
             {

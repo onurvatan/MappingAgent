@@ -1,9 +1,7 @@
 using MappingAgent.Api.Data;
-using MappingAgent.Api.Agents;
 using MappingAgent.Api.Models;
 using MappingAgent.Contracts.Enums;
 using MappingAgent.Domain.Entities;
-using Microsoft.Extensions.AI;
 using Microsoft.EntityFrameworkCore;
 using System.Globalization;
 using System.Text.Json;
@@ -12,22 +10,16 @@ namespace MappingAgent.Api.Services;
 
 public sealed class AccountingDocumentAnalysisService(
     AccountingDbContext dbContext,
-    AccountingMappingWorkflowAgent workflowAgent) : IAccountingDocumentAnalysisService
+    IAccountingMappingAgentRunner mappingAgentRunner) : IAccountingDocumentAnalysisService
 {
     public async Task<AccountingAnalysisResult> AnalyzeAsync(
         SourceFile sourceFile,
         ExtractedDocument extractedDocument,
         CancellationToken cancellationToken)
     {
-        var agent = workflowAgent.CreateAgent(AccountingMappingWorkflowAgent.AgentName);
-        var prompt = BuildPrompt(sourceFile, extractedDocument);
-        var result = await agent.RunAsync(
-            [new ChatMessage(ChatRole.User, prompt)],
-            null,
-            null,
-            cancellationToken);
+        var payload = await mappingAgentRunner.RunAsync(sourceFile, extractedDocument, cancellationToken);
+        payload = NormalizeAgentJson(payload);
 
-        var payload = result.Text ?? string.Empty;
         var draft = JsonSerializer.Deserialize<AgentMappedDocumentDraft>(
             payload,
             new JsonSerializerOptions
@@ -201,31 +193,21 @@ public sealed class AccountingDocumentAnalysisService(
             requiresReview ? null : null);
     }
 
-    private static string BuildPrompt(SourceFile sourceFile, ExtractedDocument extractedDocument)
+    private static string NormalizeAgentJson(string payload)
     {
-        return $$"""
-Analyze this parsed accounting document and return structured JSON only.
+        var trimmed = payload.Trim();
+        if (!trimmed.StartsWith("```", StringComparison.Ordinal))
+        {
+            return trimmed;
+        }
 
-Supported document kinds:
-- ExpenseInvoice
-- IncomeInvoice
-- CreditNote
-- UnknownAccountingDocument
+        var lines = trimmed.Split(Environment.NewLine, StringSplitOptions.None);
+        if (lines.Length < 3)
+        {
+            return trimmed;
+        }
 
-Supported directions:
-- Expense
-- Income
-- Unknown
-
-Parsed input:
-{
-  "sourceFileName": "{{sourceFile.FileName}}",
-  "extension": "{{sourceFile.Extension}}",
-  "parserName": "{{extractedDocument.ParserName}}",
-  "parserWarningsJson": {{extractedDocument.ParserWarningsJson}},
-  "rawText": {{JsonSerializer.Serialize(extractedDocument.RawText)}}
-}
-""";
+        return string.Join(Environment.NewLine, lines.Skip(1).SkipLast(1)).Trim();
     }
 
     private static DocumentKind ParseDocumentKind(string? value)
