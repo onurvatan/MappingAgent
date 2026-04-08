@@ -13,6 +13,8 @@ public static class WebApplicationExtensions
 
     public static WebApplication UseMappingAgentApi(this WebApplication app)
     {
+        app.UseHttpLogging();
+
         if (app.Environment.IsDevelopment())
         {
             app.MapOpenApi();

@@ -65,17 +65,24 @@ public static class ApiEndpointRouteBuilderExtensions
         FolderScanRequest request,
         IIngestionStore ingestionStore,
         IHashingService hashingService,
+        ILoggerFactory loggerFactory,
         CancellationToken cancellationToken)
     {
+        var logger = loggerFactory.CreateLogger("MappingAgent.Ingestion");
+
         if (string.IsNullOrWhiteSpace(request.FolderPath))
         {
+            logger.LogWarning("Folder scan rejected because folder path was empty.");
             return Results.BadRequest(new { error = "FolderPath is required." });
         }
 
         if (!Directory.Exists(request.FolderPath))
         {
+            logger.LogWarning("Folder scan failed because folder was not found. Path: {FolderPath}", request.FolderPath);
             return Results.NotFound(new { error = $"Folder not found: {request.FolderPath}" });
         }
+
+        logger.LogInformation("Scanning folder {FolderPath}", request.FolderPath);
 
         var job = await ingestionStore.CreateJobAsync(new IngestionJob
         {
@@ -110,6 +117,11 @@ public static class ApiEndpointRouteBuilderExtensions
         job.CompletedAtUtc = DateTimeOffset.UtcNow;
         await ingestionStore.UpdateJobAsync(job, cancellationToken);
 
+        logger.LogInformation(
+            "Folder scan completed for job {JobId}. Discovered {FileCount} supported files.",
+            job.Id,
+            sourceFiles.Count);
+
         var files = sourceFiles
             .Select(file => new DiscoveredFileDto(
                 file.FileName,
@@ -133,19 +145,25 @@ public static class ApiEndpointRouteBuilderExtensions
         Guid jobId,
         IIngestionStore ingestionStore,
         IFileParsingService fileParsingService,
+        ILoggerFactory loggerFactory,
         CancellationToken cancellationToken)
     {
+        var logger = loggerFactory.CreateLogger("MappingAgent.Ingestion");
         var job = await ingestionStore.GetJobAsync(jobId, cancellationToken);
         if (job is null)
         {
+            logger.LogWarning("Parse requested for missing ingestion job {JobId}", jobId);
             return Results.NotFound(new { error = $"Ingestion job not found: {jobId}" });
         }
 
         var files = await ingestionStore.GetFilesByJobIdAsync(jobId, cancellationToken);
         if (files.Count == 0)
         {
+            logger.LogWarning("Parse requested for job {JobId} but no files were discovered.", jobId);
             return Results.BadRequest(new { error = "The ingestion job has no discovered files." });
         }
+
+        logger.LogInformation("Parsing started for job {JobId} with {FileCount} files.", jobId, files.Count);
 
         job.Status = "Parsing";
         job.CompletedFileCount = 0;
@@ -174,6 +192,11 @@ public static class ApiEndpointRouteBuilderExtensions
 
                 file.Status = FileProcessingStatus.Queued;
                 job.CompletedFileCount++;
+                logger.LogInformation(
+                    "Parsed file {FileName} for job {JobId} with parser {ParserName}.",
+                    file.FileName,
+                    jobId,
+                    parsedDocument.ParserName);
             }
             catch (Exception ex)
             {
@@ -181,6 +204,11 @@ public static class ApiEndpointRouteBuilderExtensions
                 file.FailureReason = "ParseFailed";
                 file.FailureMessage = ex.Message;
                 job.FailedFileCount++;
+                logger.LogWarning(
+                    ex,
+                    "Parsing failed for file {FileName} in job {JobId}.",
+                    file.FileName,
+                    jobId);
             }
 
             await ingestionStore.UpdateSourceFileAsync(file, cancellationToken);
@@ -189,6 +217,12 @@ public static class ApiEndpointRouteBuilderExtensions
         job.Status = "Parsed";
         job.CompletedAtUtc = DateTimeOffset.UtcNow;
         await ingestionStore.UpdateJobAsync(job, cancellationToken);
+
+        logger.LogInformation(
+            "Parsing completed for job {JobId}. Parsed {ParsedCount}, failed {FailedCount}.",
+            jobId,
+            job.CompletedFileCount,
+            job.FailedFileCount);
 
         return Results.Ok(new
         {
@@ -204,19 +238,25 @@ public static class ApiEndpointRouteBuilderExtensions
         Guid jobId,
         IIngestionStore ingestionStore,
         IAccountingDocumentAnalysisService analysisService,
+        ILoggerFactory loggerFactory,
         CancellationToken cancellationToken)
     {
+        var logger = loggerFactory.CreateLogger("MappingAgent.Ingestion");
         var job = await ingestionStore.GetJobAsync(jobId, cancellationToken);
         if (job is null)
         {
+            logger.LogWarning("Map requested for missing ingestion job {JobId}", jobId);
             return Results.NotFound(new { error = $"Ingestion job not found: {jobId}" });
         }
 
         var files = await ingestionStore.GetFilesByJobIdAsync(jobId, cancellationToken);
         if (files.Count == 0)
         {
+            logger.LogWarning("Map requested for job {JobId} but no files were discovered.", jobId);
             return Results.BadRequest(new { error = "The ingestion job has no discovered files." });
         }
+
+        logger.LogInformation("Mapping started for job {JobId} with {FileCount} files.", jobId, files.Count);
 
         job.Status = "Mapping";
         job.CompletedFileCount = 0;
@@ -233,6 +273,10 @@ public static class ApiEndpointRouteBuilderExtensions
                 file.FailureReason = "ParseMissing";
                 file.FailureMessage = "No extracted document exists for this source file.";
                 job.FailedFileCount++;
+                logger.LogWarning(
+                    "Mapping skipped for file {FileName} in job {JobId} because extracted content was missing.",
+                    file.FileName,
+                    jobId);
                 await ingestionStore.UpdateSourceFileAsync(file, cancellationToken);
                 continue;
             }
@@ -251,6 +295,11 @@ public static class ApiEndpointRouteBuilderExtensions
                 file.FailureReason = "AgentNotConfigured";
                 file.FailureMessage = ex.Message;
                 job.FailedFileCount++;
+                logger.LogWarning(
+                    ex,
+                    "Mapping failed for file {FileName} in job {JobId} because the agent runtime was unavailable.",
+                    file.FileName,
+                    jobId);
                 await ingestionStore.UpdateSourceFileAsync(file, cancellationToken);
                 continue;
             }
@@ -278,12 +327,27 @@ public static class ApiEndpointRouteBuilderExtensions
             {
                 case FileProcessingStatus.Completed:
                     job.CompletedFileCount++;
+                    logger.LogInformation(
+                        "Mapped file {FileName} in job {JobId} successfully. Category: {Category}.",
+                        file.FileName,
+                        jobId,
+                        analysisResult.SuggestedCategory);
                     break;
                 case FileProcessingStatus.NeedsReview:
                     job.NeedsReviewFileCount++;
+                    logger.LogInformation(
+                        "Mapped file {FileName} in job {JobId} requires review. Category: {Category}.",
+                        file.FileName,
+                        jobId,
+                        analysisResult.SuggestedCategory);
                     break;
                 case FileProcessingStatus.Failed:
                     job.FailedFileCount++;
+                    logger.LogWarning(
+                        "Mapping failed for file {FileName} in job {JobId}. Reason: {Reason}",
+                        file.FileName,
+                        jobId,
+                        analysisResult.FailureReason);
                     break;
             }
         }
@@ -291,6 +355,13 @@ public static class ApiEndpointRouteBuilderExtensions
         job.Status = "Mapped";
         job.CompletedAtUtc = DateTimeOffset.UtcNow;
         await ingestionStore.UpdateJobAsync(job, cancellationToken);
+
+        logger.LogInformation(
+            "Mapping completed for job {JobId}. Completed {CompletedCount}, review {ReviewCount}, failed {FailedCount}.",
+            jobId,
+            job.CompletedFileCount,
+            job.NeedsReviewFileCount,
+            job.FailedFileCount);
 
         return Results.Ok(new
         {
@@ -325,25 +396,30 @@ public static class ApiEndpointRouteBuilderExtensions
         AccountingDbContext dbContext,
         CancellationToken cancellationToken)
     {
-        var documents = await dbContext.AccountingDocuments
+        var counterparties = await dbContext.Counterparties
             .AsNoTracking()
+            .ToDictionaryAsync(counterparty => counterparty.Id, cancellationToken);
+
+        var documents = (await dbContext.AccountingDocuments
+            .AsNoTracking()
+            .ToArrayAsync(cancellationToken))
             .OrderByDescending(document => document.ApprovedAtUtc)
             .Select(document => new AccountingDocumentSummaryDto(
                 document.Id,
                 document.InvoiceNumber,
                 document.DocumentKind,
                 document.Direction,
-                dbContext.Counterparties
-                    .Where(counterparty => counterparty.Id == document.CounterpartyId)
-                    .Select(counterparty => counterparty.Name)
-                    .FirstOrDefault() ?? "Unmatched",
+                document.CounterpartyId.HasValue &&
+                counterparties.TryGetValue(document.CounterpartyId.Value, out var counterparty)
+                    ? counterparty.Name
+                    : "Unmatched",
                 document.Currency,
                 document.TotalAmount,
                 document.ApprovedCategory,
                 document.Status,
                 document.ConfidenceScore,
                 document.ApprovedAtUtc))
-            .ToArrayAsync(cancellationToken);
+            .ToArray();
 
         return Results.Ok(documents);
     }

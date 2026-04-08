@@ -4,9 +4,11 @@ using MappingAgent.Api.Configuration;
 using MappingAgent.Api.Data;
 using MappingAgent.Api.Options;
 using MappingAgent.Api.Services;
+using Microsoft.AspNetCore.HttpLogging;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
 using System.ClientModel;
@@ -15,7 +17,10 @@ namespace MappingAgent.Api.Extensions;
 
 public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddMappingAgentApi(this IServiceCollection services, IConfiguration configuration)
+    public static IServiceCollection AddMappingAgentApi(
+        this IServiceCollection services,
+        IConfiguration configuration,
+        IHostEnvironment environment)
     {
         services.AddEndpointsApiExplorer();
         services.AddOpenApi(options =>
@@ -30,6 +35,13 @@ public static class ServiceCollectionExtensions
             });
         });
         services.AddSwaggerUI();
+        services.AddHttpLogging(options =>
+        {
+            options.LoggingFields = HttpLoggingFields.RequestMethod |
+                                    HttpLoggingFields.RequestPath |
+                                    HttpLoggingFields.ResponseStatusCode |
+                                    HttpLoggingFields.Duration;
+        });
 
         services.Configure<AgentWorkflowOptions>(
             configuration.GetSection(AgentWorkflowOptions.SectionName));
@@ -50,14 +62,14 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IIngestionStore, InMemoryIngestionStore>();
         services.AddSingleton<IHashingService, HashingService>();
         services.AddSingleton<IFileParsingService, FileParsingService>();
-        services.AddSingleton<AccountingMappingWorkflowAgent>();
-
         var foundrySettings = configuration
             .GetSection(FoundrySettings.SectionName)
             .Get<FoundrySettings>();
 
         if (foundrySettings?.IsConfigured == true)
         {
+            services.AddSingleton<AccountingMappingWorkflowAgent>();
+
             services.AddSingleton(sp =>
             {
                 var settings = sp.GetRequiredService<IOptions<FoundrySettings>>().Value;
@@ -66,7 +78,11 @@ public static class ServiceCollectionExtensions
                     return new AzureOpenAIClient(new Uri(settings.Endpoint), new ApiKeyCredential(settings.ApiKey));
                 }
 
-                return new AzureOpenAIClient(new Uri(settings.Endpoint), new Azure.Identity.DefaultAzureCredential());
+                Azure.Core.TokenCredential credential = environment.IsDevelopment()
+                    ? new Azure.Identity.AzureCliCredential()
+                    : new Azure.Identity.DefaultAzureCredential();
+
+                return new AzureOpenAIClient(new Uri(settings.Endpoint), credential);
             });
 
             services.AddSingleton<IChatClient>(sp =>

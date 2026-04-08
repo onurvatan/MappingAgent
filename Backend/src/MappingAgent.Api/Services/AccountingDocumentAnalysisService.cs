@@ -18,15 +18,27 @@ public sealed class AccountingDocumentAnalysisService(
         CancellationToken cancellationToken)
     {
         var payload = await mappingAgentRunner.RunAsync(sourceFile, extractedDocument, cancellationToken);
+        var payload = await mappingAgentRunner.RunAsync(sourceFile, extractedDocument, cancellationToken);
         payload = NormalizeAgentJson(payload);
 
-        var draft = JsonSerializer.Deserialize<AgentMappedDocumentDraft>(
-            payload,
-            new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true
-            })
-            ?? throw new InvalidOperationException("The mapping workflow returned an empty or invalid JSON payload.");
+        AgentMappedDocumentDraft draft;
+        try
+        {
+            draft = JsonSerializer.Deserialize<AgentMappedDocumentDraft>(
+                payload,
+                new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                })
+                ?? throw new InvalidOperationException("The mapping workflow returned an empty JSON payload.");
+        }
+        catch (JsonException ex)
+        {
+            var preview = payload[..Math.Min(payload.Length, 240)];
+            throw new InvalidOperationException(
+                $"The mapping workflow returned non-JSON output. Payload preview: {preview}",
+                ex);
+        }
 
         var counterparties = await dbContext.Counterparties
             .AsNoTracking()
@@ -196,18 +208,42 @@ public sealed class AccountingDocumentAnalysisService(
     private static string NormalizeAgentJson(string payload)
     {
         var trimmed = payload.Trim();
-        if (!trimmed.StartsWith("```", StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(trimmed))
         {
             return trimmed;
         }
 
-        var lines = trimmed.Split(Environment.NewLine, StringSplitOptions.None);
-        if (lines.Length < 3)
+        var fenceStart = trimmed.IndexOf("```", StringComparison.Ordinal);
+        if (fenceStart >= 0)
         {
-            return trimmed;
+            var fenceEnd = trimmed.IndexOf("```", fenceStart + 3, StringComparison.Ordinal);
+            if (fenceEnd > fenceStart)
+            {
+                var fencedBody = trimmed[(fenceStart + 3)..fenceEnd].Trim();
+                if (fencedBody.StartsWith("json", StringComparison.OrdinalIgnoreCase))
+                {
+                    fencedBody = fencedBody[4..].Trim();
+                }
+
+                trimmed = fencedBody;
+            }
         }
 
-        return string.Join(Environment.NewLine, lines.Skip(1).SkipLast(1)).Trim();
+        var objectStart = trimmed.IndexOf('{');
+        var objectEnd = trimmed.LastIndexOf('}');
+        if (objectStart >= 0 && objectEnd > objectStart)
+        {
+            return trimmed[objectStart..(objectEnd + 1)];
+        }
+
+        var arrayStart = trimmed.IndexOf('[');
+        var arrayEnd = trimmed.LastIndexOf(']');
+        if (arrayStart >= 0 && arrayEnd > arrayStart)
+        {
+            return trimmed[arrayStart..(arrayEnd + 1)];
+        }
+
+        return trimmed;
     }
 
     private static DocumentKind ParseDocumentKind(string? value)

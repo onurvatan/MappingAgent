@@ -3,7 +3,7 @@ using MappingAgent.Api.Extensions;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddMappingAgentApi(builder.Configuration);
+builder.Services.AddMappingAgentApi(builder.Configuration, builder.Environment);
 
 var app = builder.Build();
 
