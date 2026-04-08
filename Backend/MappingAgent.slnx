@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MappingAgent.Api/MappingAgent.Api.csproj" />
+    <Project Path="src/MappingAgent.Contracts/MappingAgent.Contracts.csproj" />
+    <Project Path="src/MappingAgent.Domain/MappingAgent.Domain.csproj" />
+  </Folder>
+</Solution>
